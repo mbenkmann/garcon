@@ -1,5 +1,6 @@
 package linux
 var Extension2MIME = map[string]string {
+"":"text/plain",
 ".%":"application/x-trash",
 ".~":"application/x-trash",
 ".323":"text/h323",
