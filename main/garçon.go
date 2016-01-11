@@ -575,7 +575,14 @@ func (fm *FileManager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
   w.Header().Set("ETag", fmt.Sprintf("%v", x.Id))
   //w.Header().Set("Cache-Control", fmt.Sprintf("max-age=%v",max_age))
   mime := linux.Extension2MIME[path.Ext(clean)]
-  if mime == "" { mime = "application/octet-stream" }
+  if mime == "" { 
+    // Special case for common tarball extensions
+    if strings.HasSuffix(clean, ".tar.gz") || strings.HasSuffix(clean, ".tar.xz") || strings.HasSuffix(clean, ".tar.bz2") {
+      mime = linux.Extension2MIME[".tgz"]
+    } else {
+      mime = "application/octet-stream"
+    }
+  }
   if strings.HasPrefix(mime, "text/") {
     mime += "; charset=UTF-8"
   }
