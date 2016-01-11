@@ -35,6 +35,7 @@ import (
          "github.com/mbenkmann/golib/util"
          
          "../linux"
+         "../http2"
 )
 
 const QUICKSTART = `Quickstart instructions:
@@ -445,6 +446,7 @@ func (fm *FileManager) scan(dir string, old, cur map[string]*File) error {
     hand := 0
     for hand < len(fm.handling) {
       if fm.handling[hand].match.MatchString(name) { break }
+      hand++
     }
     // NOTE: Because fm.handling has a catch-all, it is guaranteed that
     // fm.handling[hand] is valid
@@ -491,9 +493,10 @@ func (fm *FileManager) scan(dir string, old, cur map[string]*File) error {
   
   for i := range aliases1 {
     if _, conflict := cur[aliases1[i]]; conflict {
-      util.Log(2, "Gzip alias %v conflicts with real file => SKIPPED", aliases1[i])
+      util.Log(2, "Gzip alias %v => %v conflicts with real file or other alias => SKIPPED", aliases1[i], aliases2[i].Info.Name())
     } else {
       util.Log(2, "Gzip alias %v => %v", aliases1[i], aliases2[i].Info.Name())
+      cur[aliases1[i]] = aliases2[i]
     }
   }
   
@@ -571,7 +574,7 @@ func (fm *FileManager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
   
   w.Header().Set("ETag", fmt.Sprintf("%v", x.Id))
   //w.Header().Set("Cache-Control", fmt.Sprintf("max-age=%v",max_age))
-  mime := linux.Extension2MIME[path.Ext(where)]
+  mime := linux.Extension2MIME[path.Ext(clean)]
   if mime == "" { mime = "application/octet-stream" }
   if strings.HasPrefix(mime, "text/") {
     mime += "; charset=UTF-8"
@@ -581,10 +584,13 @@ func (fm *FileManager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
   var serve_content io.ReadSeeker
   serve_content = f
   
+  understands_gzip := (x.Info.Size() > fm.maxDecodeGzipSize)
   if x.Gzip {
-    understands_gzip := (x.Info.Size() > fm.maxDecodeGzipSize)
-    for _, ae := range r.Header["Accept-Encoding"] {
-      understands_gzip = understands_gzip || (ae == "gzip")
+    for _, aes := range r.Header["Accept-Encoding"] {
+      for _, ae := range strings.Split(aes, ",") {
+        ae = strings.TrimSpace(ae)
+        understands_gzip = understands_gzip || (ae == "gzip")
+      }
     }
     
     if !understands_gzip {
@@ -609,8 +615,13 @@ func (fm *FileManager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
     }
   }
   
-  util.Log(0, "%v %v %v (ETag: %v, Content-Type: %v)", http.StatusOK, r.Method, r.URL.Path, x.Id, mime)
-  http.ServeContent(w,r,"",x.Info.ModTime(),serve_content)
+  ce := ""
+  if x.Gzip && understands_gzip {
+    ce=", Content-Encoding: gzip"
+  }
+  
+  util.Log(0, "%v %v %v (ETag: %v, Content-Type: %v%v)", http.StatusOK, r.Method, r.URL.Path, x.Id, mime, ce)
+  http2.ServeContent(w,r,"",x.Info.ModTime(),serve_content)
 }
 
 
