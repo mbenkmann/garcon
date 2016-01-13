@@ -526,11 +526,11 @@ func (fm *FileManager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
   clean := path.Clean(r.URL.Path)
   // remove trailing slash
   if clean != "" && clean[len(clean)-1] == '/' { clean = clean[0:len(clean)-1] }
-  // turn "" and "." into "/"
-  if clean == "." || clean == "" { clean = "/" }
+  // turn "", "." and "/" into "/index.html"
+  if clean == "." || clean == "" || clean == "/" { clean = "/index.html" }
   
   if clean != r.URL.Path {
-    util.Log(2, "%v => %v", r.URL.Path, clean)
+    util.Log(2, "Rewrite %v => %v", r.URL.Path, clean)
   }
   
   what := strings.Split(clean,"/")
@@ -553,6 +553,12 @@ func (fm *FileManager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
       } else {
         dir = empty
       }
+    }
+    
+    if ok && x.Info.IsDir() {
+      util.Log(2, "Rewrite %v => %v", r.URL.Path, clean + "/index.html")
+      where = where + "/" + "index.html"
+      x, ok = dir["index.html"]
     }
   }
   fm.mutex.RUnlock()
