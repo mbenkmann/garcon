@@ -63,7 +63,6 @@ const (
   CHROOT
   HTTP
   VERBOSE
-  CACHE
 )
 
 const DISABLED = 0
@@ -84,7 +83,6 @@ OPTIONS
 { 0,0,"","",argv.ArgUnknown,"\f" },
 { HELP,1,  "","help",     argv.ArgNone,       "    --help \tPrint usage and exit.\n" },
 { ROOT,1, "d","directory",argv.ArgRequired,   "    -d dir, --directory=dir \tRoot of the directory tree to serve. Garçon will chroot into this directory by default.\n" },
-{ CACHE,1, "","cache-size",argv.ArgInt,       "    --cache-size=number \tStore up to <number> megabytes of most-recently requested files in memory.\n" },
 { HTTP,1, "","http-port" ,argv.ArgInt,        "    --http-port=number \tPort to listen on for HTTP connections. Default is 80.\n" },
 { UID,1,  "u","uid",      argv.ArgRequired,   "    -u uid, --uid=uid \tUID the Garçon process should run as. Defaults to the owner of the server root set with --directory.\n" },
 { GID,1,  "g","gid",      argv.ArgRequired,   "    -g gid, --gid=gid \tGID the Garçon process should run as. Defaults to the group of the server root set with --directory.\n" },
@@ -235,21 +233,10 @@ func main() {
     }
   }
   
-  var cachesize int64
-  cachesize = 10*1024*1024
-  if options[CACHE].Count() > 0 {
-    if options[CACHE].Last().Value.(int) <= 0 {
-      cachesize = 0
-    } else {
-      cachesize = 1014*1024*int64(options[CACHE].Last().Value.(int))
-    }
-  }
-  
   util.Log(1, "Server root: %v", wd)
   util.Log(1, "Process UID: %v", uid)
   util.Log(1, "Process GID: %v", gid)
   util.Log(1, "HTTP   port: %v", http_port)
-  util.Log(1, "Cache  size: %v", cachesize)
   
   // Create listeners before dropping privileges
   var https_listener net.Listener
@@ -283,7 +270,7 @@ func main() {
   wd, err = os.Getwd() // if we have chrooted, wd is now "/"
   
                                                   
-  fm,err := NewFileManager(wd, DefaultHandling, cachesize)
+  fm,err := NewFileManager(wd, DefaultHandling)
   check("scan files",err)
   
   go fm.AutoUpdate()
@@ -333,9 +320,6 @@ func (*FileInfo) Sys() interface{} {
 
 // Handles a directory tree.
 type FileManager struct {
-  // Maps File.Id to the cache for the corresponding file. 
-  //cache Cache
-  
   // inotify file descriptor used to watch all directories for changes.
   inotify int
   
@@ -352,7 +336,7 @@ type FileManager struct {
 
 /*
   Each directory entry has a unique number that is changed whenever
-  mtime changes. This number is used both as cache key and as ETag.
+  mtime changes. This number is used both as ETag.
   The <<10 for the init value of the counter makes sure that
   numbers do not repeat even if the server is restarted. Even if a
   repeat happened it would only be a problem if a number were repeated
@@ -460,9 +444,8 @@ func (gunz *Gunzipper) Close() error {
   
     rootdir: The path of the root of the directory tree
     handling: Special rules for handling certain files
-    cachesize: Size of cache in bytes
 */
-func NewFileManager(rootdir string, handling []Handling, cachesize int64) (*FileManager, error) {
+func NewFileManager(rootdir string, handling []Handling) (*FileManager, error) {
   root := &File{
     Info: &FileInfo{"",0,os.ModeDir|0777,time.Now(),true},
     Id:0,
@@ -674,7 +657,6 @@ func (fm *FileManager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
   }
 
   var serve_content io.Reader
-  //serve_content = fm.cache.Get(x, understands_gzip)
   
   gzipped := false
   
@@ -689,7 +671,6 @@ func (fm *FileManager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
     }
     defer f.Close()
     
-    //serve_content = fm.cache.Put(x, f, gzipped)
     serve_content = f
   }
     
