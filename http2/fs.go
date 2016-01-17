@@ -20,35 +20,41 @@ import (
 )
 
 
-// Like http.ServeContent, but 
-// * does not switch to "Transfer-Encoding: chunked" if "Content-Encoding: gzip" is set.
-// * does not include io errors in response to avoid leaking information
-func ServeContent(w http.ResponseWriter, req *http.Request, name string, modtime time.Time, content io.ReadSeeker) {
-	sizeFunc := func() (int64, error) {
-		size, err := content.Seek(0, os.SEEK_END)
-		if err != nil {
-			return 0, errSeeker
-		}
-		_, err = content.Seek(0, os.SEEK_SET)
-		if err != nil {
-			return 0, errSeeker
-		}
-		return size, nil
-	}
-	serveContent(w, req, name, modtime, sizeFunc, content)
-}
-
-// errSeeker is returned by ServeContent's sizeFunc when the content
-// doesn't seek properly. The underlying Seeker's error text isn't
-// included in the sizeFunc reply so it's not sent over HTTP to end
-// users.
-var errSeeker = errors.New("seeker can't seek")
-
-// if name is empty, filename is unknown. (used for mime type, before sniffing)
-// if modtime.IsZero(), modtime is unknown.
-// content must be seeked to the beginning of the file.
-// The sizeFunc is called at most once. Its error, if any, is sent in the HTTP response.
-func serveContent(w http.ResponseWriter, r *http.Request, name string, modtime time.Time, sizeFunc func() (int64, error), content io.ReadSeeker) {
+// ServeContent replies to the request using the content in the
+// provided Reader.  The main benefit of ServeContent over io.Copy
+// is that it handles Range requests properly, sets the MIME type, and
+// handles If-Modified-Since requests.
+//
+// Response's Content-Type header has to be set before calling this
+// function.
+//
+// If modtime is not the zero time or Unix epoch, ServeContent
+// includes it in a Last-Modified header in the response.  If the
+// request includes an If-Modified-Since header, ServeContent uses
+// modtime to decide whether the content needs to be sent at all.
+//
+// If content implements io.Seeker, a seek to the end
+// will be used to determine the size and then a seek to the start
+// will be used before reading the content to send.
+// The size argument passed to the function is ignored in this case.
+//
+// If size < 0 and content does not implement io.Seeker,
+// "Transfer-Encoding: chunked" will be used and range requests will
+// not be supported.
+//
+// If size >= 0 and content does not support io.Seeker, range requests
+// will still be supported as long as they don't request overlapping
+// ranges. In this case dummy reads will be used to
+// skip parts that are not transmitted. If an overlapping range is requested
+// the range request will be ignored and the whole data will be sent.
+//
+// If the caller has set w's ETag header, ServeContent uses it to
+// handle requests using If-Range and If-None-Match.
+//
+// Note that *os.File implements the io.ReadSeeker interface.
+func ServeContent(w http.ResponseWriter, r *http.Request, modtime time.Time, size int64, content io.Reader) {
+	var err error
+	
 	if checkLastModified(w, r, modtime) {
 		return
 	}
@@ -59,25 +65,31 @@ func serveContent(w http.ResponseWriter, r *http.Request, name string, modtime t
 
 	code := http.StatusOK
 
-	// If Content-Type isn't set, use the file's extension to find it, but
-	// if the Content-Type is unset explicitly, do not sniff the type.
 	ctypes := w.Header()["Content-Type"]
 	var ctype string
 	if len(ctypes) > 0 {
 		ctype = ctypes[0]
 	}
 
-	size, err := sizeFunc()
-	if err != nil {
-		http.Error(w, "500 Internal Server Error", http.StatusInternalServerError)
-		return
+	seeker, can_seek := content.(io.Seeker)
+	if can_seek {
+		// seek to end to determine size
+		size, err = seeker.Seek(0, os.SEEK_END)
+		if err == nil {
+			// seek back to start for serving content
+			_, err = seeker.Seek(0, os.SEEK_SET)
+		}
+		if err != nil {
+			http.Error(w, "500 Internal Server Error", http.StatusInternalServerError)
+		        return
+		}
 	}
 
 	// handle Content-Range header.
 	sendSize := size
 	var sendContent io.Reader = content
 	if size >= 0 {
-		ranges, err := parseRange(rangeReq, size)
+		ranges, err := parseRange(rangeReq, size, can_seek, !can_seek)
 		if err != nil {
 			http.Error(w, "416 Requested Range Not Satisfiable", http.StatusRequestedRangeNotSatisfiable)
 			return
@@ -103,7 +115,12 @@ func serveContent(w http.ResponseWriter, r *http.Request, name string, modtime t
 			// A response to a request for a single range MUST NOT
 			// be sent using the multipart/byteranges media type."
 			ra := ranges[0]
-			if _, err := content.Seek(ra.start, os.SEEK_SET); err != nil {
+			if can_seek {
+			  _, err = seeker.Seek(ra.start, os.SEEK_SET)
+			} else {
+			  err = skip(content, ra.start)
+			}
+			if err != nil {
 				http.Error(w, "416 Requested Range Not Satisfiable", http.StatusRequestedRangeNotSatisfiable)
 				return
 			}
@@ -120,13 +137,21 @@ func serveContent(w http.ResponseWriter, r *http.Request, name string, modtime t
 			sendContent = pr
 			defer pr.Close() // cause writing goroutine to fail and exit if CopyN doesn't finish.
 			go func() {
+				var offset int64 = 0
 				for _, ra := range ranges {
 					part, err := mw.CreatePart(ra.mimeHeader(ctype, size))
 					if err != nil {
 						pw.CloseWithError(err)
 						return
 					}
-					if _, err := content.Seek(ra.start, os.SEEK_SET); err != nil {
+					if can_seek {
+						_, err = seeker.Seek(ra.start, os.SEEK_SET)
+					} else {
+						// parseRange() guarantees that ranges
+						// don't overlap and are sorted by ascending start
+						err = skip(content, ra.start-offset)
+					}
+					if err != nil {
 						pw.CloseWithError(err)
 						return
 					}
@@ -134,6 +159,7 @@ func serveContent(w http.ResponseWriter, r *http.Request, name string, modtime t
 						pw.CloseWithError(err)
 						return
 					}
+					offset = ra.start + ra.length
 				}
 				mw.Close()
 				pw.Close()
@@ -147,8 +173,29 @@ func serveContent(w http.ResponseWriter, r *http.Request, name string, modtime t
 	w.WriteHeader(code)
 
 	if r.Method != "HEAD" {
-		io.CopyN(w, sendContent, sendSize)
+		if sendSize >= 0 {
+			io.CopyN(w, sendContent, sendSize)
+		} else {
+			io.Copy(w, sendContent)
+		}
 	}
+}
+
+// Reads and discards howmany bytes from r.
+func skip(r io.Reader, howmany int64) error {
+  var buf [32768]byte
+  var err error
+  var n int
+  for howmany > 0 {
+    if howmany > int64(len(buf)) {
+      n, err = r.Read(buf[:])
+    } else {
+      n, err = r.Read(buf[:howmany])
+    }
+    if n <= 0 && err != nil { return err }
+    howmany -= int64(n)
+  }
+  return nil
 }
 
 var unixEpochTime = time.Unix(0, 0)
@@ -255,7 +302,13 @@ func (r httpRange) mimeHeader(contentType string, size int64) textproto.MIMEHead
 }
 
 // parseRange parses a Range header string as per RFC 2616.
-func parseRange(s string, size int64) ([]httpRange, error) {
+// If overlap_allowed == false, an error will be returned if
+// multiple ranges are requested that overlap.
+// If sorted==true, the ranges will be returned in ascending order
+// of start offset. If sorted==false, ranges will be returned in the
+// order in which they occur in s.
+// overlap_allowed == false implies sorted == true
+func parseRange(s string, size int64, overlap_allowed bool, sorted bool) ([]httpRange, error) {
 	if s == "" {
 		return nil, nil // header not present
 	}
@@ -309,6 +362,29 @@ func parseRange(s string, size int64) ([]httpRange, error) {
 		}
 		ranges = append(ranges, r)
 	}
+	
+	// sort ranges by ascending start
+	// insertion sort
+	if sorted || !overlap_allowed {
+		for x := 1; x < len(ranges); x++ {
+			child_to_find_place_for := ranges[x]
+			y := x
+			for y > 0 && ranges[y-1].start > child_to_find_place_for.start {
+				ranges[y] = ranges[y-1]
+				y--
+			}
+			ranges[y] = child_to_find_place_for
+		}
+	}
+	
+	if !overlap_allowed {
+		for x := 1; x < len(ranges); x++ {
+			if ranges[x].start < ranges[x-1].start + ranges[x-1].length {
+				return nil, errors.New("overlapping ranges")
+			}
+		}
+	}
+	
 	return ranges, nil
 }
 

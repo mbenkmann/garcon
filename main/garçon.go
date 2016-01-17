@@ -17,7 +17,6 @@ package main
 
 import (
          "io"
-         "io/ioutil"
          "os"
          "fmt"
          "net"
@@ -25,7 +24,7 @@ import (
          "path"
          "sync"
          "time"
-         "bytes"
+         byts "bytes"
          "regexp"
          "strings"
          "strconv"
@@ -85,7 +84,7 @@ OPTIONS
 { 0,0,"","",argv.ArgUnknown,"\f" },
 { HELP,1,  "","help",     argv.ArgNone,       "    --help \tPrint usage and exit.\n" },
 { ROOT,1, "d","directory",argv.ArgRequired,   "    -d dir, --directory=dir \tRoot of the directory tree to serve. Garçon will chroot into this directory by default.\n" },
-{ CACHE,1, "","cache-size",argv.ArgInt,       "    --cache-size=number \tStore up to <number> megabytes of most-recently requested files in memory. See also GZIP section below.\n" },
+{ CACHE,1, "","cache-size",argv.ArgInt,       "    --cache-size=number \tStore up to <number> megabytes of most-recently requested files in memory.\n" },
 { HTTP,1, "","http-port" ,argv.ArgInt,        "    --http-port=number \tPort to listen on for HTTP connections. Default is 80.\n" },
 { UID,1,  "u","uid",      argv.ArgRequired,   "    -u uid, --uid=uid \tUID the Garçon process should run as. Defaults to the owner of the server root set with --directory.\n" },
 { GID,1,  "g","gid",      argv.ArgRequired,   "    -g gid, --gid=gid \tGID the Garçon process should run as. Defaults to the group of the server root set with --directory.\n" },
@@ -95,7 +94,7 @@ OPTIONS
 { 0, 0, "", "",argv.ArgUnknown, "\f" },
 { UNKNOWN, 1, "", "",     argv.ArgUnknown, `CONTENT-ENCODING: GZIP
 
-To reduce bandwidth usage and improve page load times, files in text-based formats like HTML and CSS can be compressed with gzip. When Garçon sees a file with an extension from the following table, in addition to serving it under its actual name, Garçon will serve it under an alternative name. If the alternative name is requested by a client without gzip support, Garçon will decompress it unless the file is larger than 10% of the cache size. Otherwise Garçon will send the gzipped data with an added "Content-Encoding: gzip" header. If an actual file with the translated name exists, that will take precedence.
+To reduce bandwidth usage and improve page load times, files in text-based formats like HTML and CSS can be compressed with gzip. When Garçon sees a file with an extension from the following table, in addition to serving it under its actual name, Garçon will serve it under an alternative name. If the alternative name is requested by a client without gzip support, Garçon will decompress it on the fly. Otherwise Garçon will send the gzipped data with an added "Content-Encoding: gzip" header. If an actual file with the translated name exists, that will take precedence.
 
 `+"    .svgz \t=> .svg\n"+
   "    .svg.gz \t=> .svg\n"+
@@ -302,25 +301,46 @@ func main() {
   check("serve http",e)
 }
 
+/*
+  A simple implementation of os.FileInfo to use for in-memory files.
+*/
+type FileInfo struct {
+  name string       // base name of the file
+  size int64        // length in bytes for regular files; system-dependent for others
+  mode os.FileMode     // file mode bits
+  modTime time.Time // modification time
+  isDir bool        // abbreviation for Mode().IsDir()
+}
 
-// Each file can have multiple cache entries (plain, gzipped,...)
-const NUM_CACHES_PER_FILE = 1
+func (f *FileInfo) Name() string {
+  return f.name
+}
+func (f *FileInfo) Size() int64 {
+  return f.size
+}
+func (f *FileInfo) Mode() os.FileMode {
+  return f.mode
+}
+func (f *FileInfo) ModTime() time.Time {
+  return f.modTime
+}
+func (f *FileInfo) IsDir() bool {
+  return f.isDir
+}
+func (*FileInfo) Sys() interface{} {
+  return nil
+}
 
 // Handles a directory tree.
 type FileManager struct {
-  // Maps File.Id to the caches for the corresponding file. 
-  cache map[uint64][NUM_CACHES_PER_FILE]interface{}
-  
-  // The contents of the root directory. Each key is a file name, possibly an alias
-  // generated through Handling.gzip.
-  tree map[string]*File
+  // Maps File.Id to the cache for the corresponding file. 
+  //cache Cache
   
   // inotify file descriptor used to watch all directories for changes.
   inotify int
   
-  // The path of the root directory. If the server is chrooted, this
-  // will typically be "/"
-  rootdir string
+  // The root directory.
+  root *File
   
   // Whenever tree is accessed, this mutex is used to protect
   // ServerHTTP() from AutoUpdate()
@@ -328,12 +348,6 @@ type FileManager struct {
   
   // The handling rules for file patterns.
   handling []Handling
-  
-  // If an HTTP request does not have Accept-Encoding: gzip but the
-  // requested file is gzipped, it will be extracted into a buffer
-  // and served from that, but only if the compressed file size
-  // is smaller than this number.
-  maxDecodeGzipSize int64
 }
 
 /*
@@ -362,6 +376,82 @@ type File struct {
   // true iff this is an alias for a gzipped file that is to be served
   // with Content-Encoding: gzip.
   Gzip bool
+  
+  // The meaning depends on the data type:
+  //   string: The path of the filesystem directory containing the file.
+  //           By appending "/" + Info.Name(), you get the path for os.Open().
+  //   []byte: The raw data of this file.
+  Data interface{}
+}
+
+/*
+  Returns the File's data.
+  
+  keep_gzipped: if true and the file is gzipped, return it as is.
+                if false and the file is gzipped, return the decompressed data.
+                if the file is not gzipped, no effect.
+  
+  Returns:
+    stream: the data, this may or may not implement io.Seeker
+    is_gzipped: true if stream is gzipped. if keep_gzipped is false, this is always false.
+    err: if an error has occurred
+  
+  NOTE: If err!=nil, the caller must call stream.Close() when done.
+*/
+func (f *File) GetStream(keep_gzipped bool) (stream io.ReadCloser, is_gzipped bool, err error) {
+  switch data := f.Data.(type) {
+    case string:
+      stream, err = os.Open(data+"/"+f.Info.Name())
+      if err != nil { return }
+      
+    case []byte:
+      stream = &BytesReadCloser{*byts.NewReader(data)}
+    
+    default: panic("Unexpected Data type")
+  }
+
+  is_gzipped = f.Gzip
+  if keep_gzipped || !is_gzipped { return }
+  // If we get here, keep_gzipped == false, but is_gzipped == true, so we need a wrapper
+  is_gzipped = false
+  stream, err = NewGunzipper(stream)
+  return
+}
+
+type BytesReadCloser struct {
+  byts.Reader
+}
+
+func (*BytesReadCloser) Close() error {return nil}
+
+/*
+  Takes a gzipped stream and returns a ReadCloser from which you can
+  read the ungzipped data. Unlike the stream returned by gzip.NewReader()
+  this one closes the original stream when Close() is called on the
+  unzipper (provided the original stream implements io.Closer).
+*/
+func NewGunzipper(gzipped io.Reader) (io.ReadCloser, error) {
+  g, err := gzip.NewReader(gzipped)
+  if err != nil { return nil, err }
+  return &Gunzipper{g,gzipped}, nil
+}
+
+type Gunzipper struct {
+  gunzip io.ReadCloser
+  orig io.Reader
+}
+
+func (gunz *Gunzipper) Read(p []byte) (n int, err error) {
+  return gunz.gunzip.Read(p)
+}
+
+func (gunz *Gunzipper) Close() error {
+  err1 := gunz.gunzip.Close()
+  if closer, can_be_closed := gunz.orig.(io.Closer); can_be_closed {
+    err2 := closer.Close()
+    if err2 != nil { return err2 }
+  }
+  return err1
 }
 
 /*
@@ -373,8 +463,15 @@ type File struct {
     cachesize: Size of cache in bytes
 */
 func NewFileManager(rootdir string, handling []Handling, cachesize int64) (*FileManager, error) {
-  fm := &FileManager{tree:map[string]*File{}, inotify:-1, rootdir:rootdir, handling:handling, maxDecodeGzipSize:(cachesize+9)/10}
-  err := fm.scan(rootdir, map[string]*File{}, fm.tree)
+  root := &File{
+    Info: &FileInfo{"",0,os.ModeDir|0777,time.Now(),true},
+    Id:0,
+    Contents:map[string]*File{},
+    Gzip:false,
+    Data:rootdir,
+  }
+  fm := &FileManager{root:root, inotify:-1, handling:handling}
+  err := fm.scan(rootdir, map[string]*File{}, root.Contents)
   if err != nil { return nil, err }
   return fm, nil
 }
@@ -400,13 +497,13 @@ func (fm *FileManager) AutoUpdate() {
       }
     }
     newtree := map[string]*File{}
-    err = fm.scan(fm.rootdir, fm.tree, newtree)
+    err = fm.scan(fm.root.Data.(string), fm.root.Contents, newtree)
     if err != nil { 
       util.Log(0, "ERROR! re-scan: %v", err)
       time.Sleep(30*time.Second)
     } else {
       fm.mutex.Lock()
-      fm.tree = newtree
+      fm.root.Contents = newtree
       fm.mutex.Unlock()
       time.Sleep(5*time.Second)
     }
@@ -451,7 +548,7 @@ func (fm *FileManager) scan(dir string, old, cur map[string]*File) error {
     // NOTE: Because fm.handling has a catch-all, it is guaranteed that
     // fm.handling[hand] is valid
     
-    n := &File{Info:fi}
+    n := &File{Info:fi, Data:dir}
     
     unchanged := false
     if o, ok := old[name]; ok && o.Info.ModTime().Equal(fi.ModTime()) && o.Info.IsDir() == n.Info.IsDir() {
@@ -514,7 +611,10 @@ func (fm *FileManager) scan(dir string, old, cur map[string]*File) error {
   return nil
 }
 
+
 func (fm *FileManager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+  var err error
+  
   switch r.Method {
     case "", "GET", "HEAD": // OK, we support these
     default: w.Header().Set("Allow", "GET, HEAD")
@@ -535,19 +635,16 @@ func (fm *FileManager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
   
   what := strings.Split(clean,"/")
   
-  where := "."
-  
   var x *File
   ok := false
   fm.mutex.RLock()
   {
-    dir := fm.tree
+    dir := fm.root.Contents
     for _, name := range what {
       if name == "" { continue }
       if x, ok = dir[name]; !ok {
         break
       }
-      where = where + "/" + x.Info.Name()
       if x.Info.IsDir() {
         dir = x.Contents
       } else {
@@ -557,7 +654,6 @@ func (fm *FileManager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
     
     if ok && x.Info.IsDir() {
       util.Log(2, "Rewrite %v => %v", r.URL.Path, clean + "/index.html")
-      where = where + "/" + "index.html"
       x, ok = dir["index.html"]
     }
   }
@@ -569,14 +665,39 @@ func (fm *FileManager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
     return
   }
   
-  f, err := os.Open(where)
-  if err != nil {
-    util.Log(0, "ERROR! open(%v): %v", where, err)
-    util.Log(0, "%v %v %v", http.StatusInternalServerError, r.Method, r.URL.Path)
-    http.Error(w, "internal server error", http.StatusInternalServerError)
-    return
+  understands_gzip := false
+  for _, aes := range r.Header["Accept-Encoding"] {
+    for _, ae := range strings.Split(aes, ",") {
+      ae = strings.TrimSpace(ae)
+      understands_gzip = understands_gzip || (ae == "gzip")
+    }
   }
-  defer f.Close()
+
+  var serve_content io.Reader
+  //serve_content = fm.cache.Get(x, understands_gzip)
+  
+  gzipped := false
+  
+  if serve_content == nil {
+    var f io.ReadCloser
+    f, gzipped, err = x.GetStream(understands_gzip)
+    if err != nil {
+      util.Log(0, "ERROR! GetStream(): %v", err)
+      util.Log(0, "%v %v %v", http.StatusInternalServerError, r.Method, r.URL.Path)
+      http.Error(w, "internal server error", http.StatusInternalServerError)
+      return
+    }
+    defer f.Close()
+    
+    //serve_content = fm.cache.Put(x, f, gzipped)
+    serve_content = f
+  }
+    
+  ce := ""
+  if gzipped {
+    w.Header().Set("Content-Encoding", "gzip")
+    ce=", Content-Encoding: gzip"
+  }
   
   w.Header().Set("ETag", fmt.Sprintf("%v", x.Id))
   //w.Header().Set("Cache-Control", fmt.Sprintf("max-age=%v",max_age))
@@ -594,47 +715,8 @@ func (fm *FileManager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
   }
   w.Header().Set("Content-Type", mime)
   
-  var serve_content io.ReadSeeker
-  serve_content = f
-  
-  understands_gzip := (x.Info.Size() > fm.maxDecodeGzipSize)
-  if x.Gzip {
-    for _, aes := range r.Header["Accept-Encoding"] {
-      for _, ae := range strings.Split(aes, ",") {
-        ae = strings.TrimSpace(ae)
-        understands_gzip = understands_gzip || (ae == "gzip")
-      }
-    }
-    
-    if !understands_gzip {
-      g, err := gzip.NewReader(f)
-      if err != nil {
-        util.Log(0, "ERROR! un-gzip %v: %v", where, err)
-        understands_gzip = true // fall back to sending the original data
-      } else {
-        defer g.Close()
-        data, err := ioutil.ReadAll(g)
-        if err != nil {
-          util.Log(0, "ERROR! un-gzip %v: %v", where, err)
-          understands_gzip = true // fall back to sending the original data
-        } else {
-          serve_content = bytes.NewReader(data)
-        }
-      }
-    }
-    
-    if understands_gzip {
-      w.Header().Set("Content-Encoding", "gzip")
-    }
-  }
-  
-  ce := ""
-  if x.Gzip && understands_gzip {
-    ce=", Content-Encoding: gzip"
-  }
-  
   util.Log(0, "%v %v %v (ETag: %v, Content-Type: %v%v)", http.StatusOK, r.Method, r.URL.Path, x.Id, mime, ce)
-  http2.ServeContent(w,r,"",x.Info.ModTime(),serve_content)
+  http2.ServeContent(w,r,x.Info.ModTime(),-1,serve_content)
 }
 
 
